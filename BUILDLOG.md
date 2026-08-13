@@ -25,3 +25,7 @@
 - Ran a full real test-mode payment via net banking through ngrok tunnel
 - Webhook signature verified, event processed, tenant 2 confirmed flipped free -> pro in DB
 - Verified with direct SQL query, not just API response
+## Phase 3 — Webhook security probes
+- Forged signature test: request with fake X-Razorpay-Signature -> rejected (400)
+- Replay test: same event_id sent twice with valid signature -> first "processed",
+  second "duplicate_ignored" (test_webhook_replay.py, verified via script output)
