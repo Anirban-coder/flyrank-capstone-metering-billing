@@ -20,3 +20,8 @@
   test mode (no card needed), signed webhooks (X-Razorpay-Signature, HMAC-SHA256),
   checkout flow, subscription events
 - Everything else in the brief (idempotency, quota logic, cost math, architecture) is unchanged
+## Phase 3 — Razorpay integration
+- Built /checkout, /checkout-page, /webhooks/razorpay with Claude
+- Ran a full real test-mode payment via net banking through ngrok tunnel
+- Webhook signature verified, event processed, tenant 2 confirmed flipped free -> pro in DB
+- Verified with direct SQL query, not just API response

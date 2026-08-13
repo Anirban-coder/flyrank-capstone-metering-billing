@@ -1,5 +1,10 @@
+import hmac
+import hashlib
+import os
+import razorpay
 from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -8,6 +13,14 @@ from app.database import get_db
 from app import models
 
 app = FastAPI()
+
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+PRO_PLAN_PRICE_PAISE = 49900  # ₹499.00
 
 
 class GenerateRequest(BaseModel):
@@ -103,3 +116,102 @@ async def generate(body: GenerateRequest, db: Session = Depends(get_db)):
         "usage_after": current_usage + body.quantity,
         "quota": quota,
     }
+
+class CheckoutRequest(BaseModel):
+    tenant_id: int
+
+
+@app.post("/checkout")
+async def checkout(body: CheckoutRequest, db: Session = Depends(get_db)):
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == body.tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail=f"Tenant {body.tenant_id} not found")
+
+    order = razorpay_client.order.create({
+        "amount": PRO_PLAN_PRICE_PAISE,
+        "currency": "INR",
+        "notes": {"tenant_id": str(body.tenant_id)},
+    })
+
+    return {
+        "order_id": order["id"],
+        "amount": order["amount"],
+        "currency": order["currency"],
+        "razorpay_key_id": RAZORPAY_KEY_ID,
+        "checkout_page": f"/checkout-page?order_id={order['id']}&amount={order['amount']}",
+    }
+
+
+@app.get("/checkout-page", response_class=HTMLResponse)
+async def checkout_page(order_id: str, amount: int):
+    return f"""
+    <html>
+    <body>
+      <h2>Upgrade to Pro</h2>
+      <button id="pay-btn">Pay with Razorpay (test mode)</button>
+      <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+      <script>
+        document.getElementById('pay-btn').onclick = function() {{
+          var options = {{
+            "key": "{RAZORPAY_KEY_ID}",
+            "amount": "{amount}",
+            "currency": "INR",
+            "name": "Billing Capstone",
+            "order_id": "{order_id}",
+            "handler": function (response) {{
+              document.body.innerHTML = "<h3>Payment complete. Webhook will update your plan shortly.</h3>";
+            }}
+          }};
+          var rzp = new Razorpay(options);
+          rzp.open();
+        }};
+      </script>
+    </body>
+    </html>
+    """
+
+
+@app.post("/webhooks/razorpay")
+async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+
+    expected_signature = hmac.new(
+        key=RAZORPAY_WEBHOOK_SECRET.encode(),
+        msg=raw_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_signature, signature):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    payload = await request.json()
+    event_id = request.headers.get("X-Razorpay-Event-Id", payload.get("id", ""))
+
+    already_processed = (
+        db.query(models.ProcessedWebhookEvent)
+        .filter(models.ProcessedWebhookEvent.stripe_event_id == event_id)
+        .first()
+    )
+    if already_processed:
+        return {"status": "duplicate_ignored"}
+
+    event_type = payload.get("event")
+    if event_type == "payment.captured":
+        order_notes = payload["payload"]["payment"]["entity"].get("notes", {})
+        tenant_id = int(order_notes.get("tenant_id"))
+
+        pro_plan = db.query(models.Plan).filter(models.Plan.name == "pro").first()
+        sub = (
+            db.query(models.Subscription)
+            .filter(models.Subscription.tenant_id == tenant_id, models.Subscription.status == "active")
+            .first()
+        )
+        if sub and pro_plan:
+            sub.plan_id = pro_plan.id
+            db.commit()
+
+    db.add(models.ProcessedWebhookEvent(stripe_event_id=event_id))
+    db.commit()
+
+    return {"status": "processed"}
