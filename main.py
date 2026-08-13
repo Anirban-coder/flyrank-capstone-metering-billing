@@ -11,7 +11,7 @@ from sqlalchemy import func
 
 from app.database import get_db
 from app import models
-
+from app.pricing import total_ai_token_cost_cents, api_call_cost_cents
 app = FastAPI()
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
@@ -28,6 +28,7 @@ class GenerateRequest(BaseModel):
     usage_type: str  # "api_call" or "ai_tokens"
     quantity: int
     idempotency_key: str
+    token_category: str | None = None
 
 
 def get_current_usage(db: Session, tenant_id: int, usage_type: str) -> int:
@@ -101,6 +102,7 @@ async def generate(body: GenerateRequest, db: Session = Depends(get_db)):
         type=body.usage_type,
         quantity=body.quantity,
         idempotency_key=body.idempotency_key,
+        token_category=body.token_category,
         created_at=datetime.now(timezone.utc),
     )
     db.add(event)
@@ -215,3 +217,57 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
     db.commit()
 
     return {"status": "processed"}
+@app.get("/usage/{tenant_id}")
+async def get_usage(tenant_id: int, db: Session = Depends(get_db)):
+    tenant = db.query(models.Tenant).filter(models.Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail=f"Tenant {tenant_id} not found")
+
+    sub = (
+        db.query(models.Subscription)
+        .filter(models.Subscription.tenant_id == tenant_id, models.Subscription.status == "active")
+        .first()
+    )
+    if not sub:
+        raise HTTPException(status_code=404, detail=f"No active subscription for tenant {tenant_id}")
+
+    plan = db.query(models.Plan).filter(models.Plan.id == sub.plan_id).first()
+
+    # API calls: simple sum + flat-rate cost
+    api_call_events = db.query(models.UsageEvent).filter(
+        models.UsageEvent.tenant_id == tenant_id,
+        models.UsageEvent.type == "api_call",
+    ).all()
+    api_call_total = sum(e.quantity for e in api_call_events)
+    api_call_cost = api_call_cost_cents(api_call_total)
+
+    # AI tokens: grouped by category, since each category has its own price.
+    token_events = db.query(models.UsageEvent).filter(
+        models.UsageEvent.tenant_id == tenant_id,
+        models.UsageEvent.type == "ai_tokens",
+    ).all()
+
+    usage_by_category = {}
+    for e in token_events:
+        category = e.token_category or "input"  # fallback for any legacy rows with no category
+        usage_by_category[category] = usage_by_category.get(category, 0) + e.quantity
+
+    token_total = sum(usage_by_category.values())
+    token_cost = total_ai_token_cost_cents(usage_by_category)
+
+    return {
+        "tenant_id": tenant_id,
+        "plan": plan.name,
+        "api_calls": {
+            "used": api_call_total,
+            "limit": plan.monthly_api_call_limit,
+            "cost_cents": api_call_cost,
+        },
+        "ai_tokens": {
+            "used": token_total,
+            "limit": plan.monthly_token_limit,
+            "by_category": usage_by_category,
+            "cost_cents": token_cost,
+        },
+        "total_cost_cents": api_call_cost + token_cost,
+    }
