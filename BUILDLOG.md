@@ -29,3 +29,8 @@
 - Forged signature test: request with fake X-Razorpay-Signature -> rejected (400)
 - Replay test: same event_id sent twice with valid signature -> first "processed",
   second "duplicate_ignored" (test_webhook_replay.py, verified via script output)
+  ## Phase 4 — Cost calculation
+- Built app/pricing.py with Claude: separate per-category pricing, reasoning billed as output
+- 7 pinned pytest tests, all passing
+- Verified live: sent real /generate requests matching the pinned test's exact quantities,
+  GET /usage/2 returned cost_cents=230, matching test_full_mixed_usage_total exactly
